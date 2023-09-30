@@ -1,0 +1,906 @@
+---
+title: "Bike Rentals"
+output: html_document
+date: "2023-07-23"
+---
+
+We have hourly rental data spanning two years. The dataset set has the info about the first 19 days of every month. Our objective is to build a prediction model to identify the number of rentals that will get booked at a particular hour of the day.
+
+### ***Reading in the required libraries***
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(randomForest)
+library(gbm)
+```
+
+### **Reading in the Bike rental data**
+
+```{r}
+
+bike_df = read.csv("/Users/aishwarya/downloads/train.csv")
+
+options(width = 300)
+
+head(bike_df)
+```
+
+### **Understanding the data**
+
+```{r}
+
+dim(bike_df)
+```
+
+There are ***12 columns and 10,886 rows*** in the bike dataset.
+
+```{r}
+
+colnames(bike_df)[colnames(bike_df) == "count"] <- "bike_count"
+
+str(bike_df)
+```
+
+All the columns in the dataset are either integers or numeric.
+
+[*Columns - season and weather are integers*]{.underline} here because integers are mapped to a season / weather condition
+
+#### ***Categorical variables***
+
+**datetime** - hourly date + timestamp  - We cannot use this variable as is so we need to spit this into year, month, day and hour.
+
+**season** 
+
+1 = spring
+
+2 = summer
+
+3 = fall
+
+4 = winter 
+
+**holiday** - whether the day is considered a holiday (0/1)
+
+**workingday** - whether the day is neither a weekend nor holiday (0/1)
+
+**weather** - 
+
+1: Clear, Few clouds, Partly cloudy, Partly cloudy\
+2: Mist + Cloudy, Mist + Broken clouds, Mist + Few clouds, Mist\
+3: Light Snow, Light Rain + Thunderstorm + Scattered clouds, Light Rain + Scattered clouds\
+4: Heavy Rain + Ice Pallets + Thunderstorm + Mist, Snow + Fog \
+
+#### ***Numeric Variables***
+
+**temp** - temperature in Celsius\
+**atemp** - "feels like" temperature in Celsius\
+**humidity** - relative humidity\
+**windspeed** - wind speed\
+**casual** - number of non-registered user rentals initiated\
+**registered** - number of registered user rentals initiated\
+***bike_count - number of total rentals ( This is the target variable)***
+
+```{r}
+
+# Convert categorical variables into a factor with custom labels
+
+bike_df$workingday <- factor(bike_df$workingday, levels = c(0, 1), labels = c("Non_Working_day", "Working_day"))
+
+
+bike_df$weather <- factor(bike_df$weather, levels = c(1, 2, 3, 4),
+                          labels = c("Clear", "Cloud_Mist", "Little_rain_or_snow", "Heavy_rain_or_snow"))
+
+
+bike_df$season <- factor(bike_df$season, levels = c(1, 2, 3, 4),
+                         labels = c("Spring", "Summer", "Fall", "Winter"))
+
+
+bike_df$holiday <- factor(bike_df$holiday, levels = c(0, 1), labels = c("Non_Holiday", "Holiday"))
+
+table(bike_df$season)
+table(bike_df$weather)
+table(bike_df$workingday)
+table(bike_df$holiday)
+
+```
+
+```{r}
+
+qc_missing_val = colSums(is.na(bike_df)) #checking for missing values
+
+print(qc_missing_val)
+
+
+numeric_cols <- sapply(bike_df, is.numeric)
+
+# Check for zeroes in numeric columns
+zero_counts <- colSums(bike_df[, numeric_cols] == 0, na.rm = TRUE)
+
+print((zero_counts))
+
+```
+
+There are ***no missing values*** in this dataset!
+
+But the ***windspeed column has a lot of zero values*** which is not expected. This might be a data gap.
+
+```{r}
+
+#Splitting the datetime variable into Year, month, day and hour to make better sense out the data
+
+bike_df$year = year(bike_df$datetime)
+bike_df$month = month(bike_df$datetime)
+bike_df$day = day(bike_df$datetime)
+bike_df$hour = hour(bike_df$datetime)
+
+head(bike_df)  
+```
+
+### Exploratory Data Analysis
+
+Lets start by looking at the numeric and categorical variable relationship with the bike count
+
+```{r}
+
+
+
+bike_df_num = bike_df[, 6:12 ]
+head(bike_df_num) #Creating a dataframe with only numeric variables
+
+bike_df_cat_cols_w_count = c('year','month','day','hour', 'season', 'holiday', 'workingday', 'weather', 'bike_count' )
+bike_df_cat_cols = c('year','month','day','hour', 'season', 'holiday', 'workingday', 'weather' )
+bike_df_cat = bike_df[bike_df_cat_cols_w_count] # Creating a dataframe with categoical variables (Note: Kept count variable here to make a few plots)
+head(bike_df_cat)
+
+
+```
+
+[**Understanding Numeric variables based on correlation matrix**]{.underline}
+
+```{r}
+
+library(corrplot)
+
+
+# Compute the Pearson correlation matrix
+cor_matrix <- cor(bike_df_num, method = "pearson")
+
+
+corrplot(cor_matrix, method = "color", type = "upper",
+         tl.cex = 0.7, tl.col = "black", tl.srt = 45,
+         col = colorRampPalette(c("blue", "white", "red"))(100),
+         addCoef.col = "black", number.cex = 0.7, 
+         cl.cex = 0.7, tl.offset = 1, diag = FALSE)
+
+```
+
+### [*Findings based on the correlation matrix -*]{.underline}
+
+1.  Temp and ATemp have a high positive correlation. Also, these metrics are correlated to the target variable. Therefore, we don't need both the metrics to predict the target variable as they will introduce multicollinearity.
+2.  Humidity has a small negative correlation with the target variable (bike_count)
+3.  Windspeed has a very small - no correlation with the target variable ( Also, it has a lot of zero values!). Therefore, we might want to remove this metric from our analysis.
+4.  Casual and Registered are highly correlated with count. But we cannot use these metrics for our analysis as these are basically components of the target variable ( causal + registered = count )
+
+**\--\> Ultimately, Only temp and humidity seems to be the useful numeric metrics to predict count**
+
+#### [*Understanding the categorical variable based on bar charts*]{.underline}
+
+```{r}
+
+sum_bike_count_weather <- aggregate(bike_count ~ weather, data = bike_df, FUN = sum)
+
+sum_bike_count_weather
+
+weather_count_plot = ggplot(sum_bike_count_weather, aes(x = weather, y = bike_count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(x = "Weather", y = "Bike_co
+       unt (Total bikes rented)", title = "Bikes rented vs Weather")
+
+weather_count_plot
+```
+
+-   As expected, more bikes are rented when the weather is clear or partly cloudy (1st bucket).
+
+```{r}
+
+filtered_bike_df_weather_check = bike_df[bike_df$weather == 'Heavy_rain_or_snow', ]
+
+filtered_bike_df_weather_check
+```
+
+-   We just have one data point for the 'Heavy rain or snow' category, therefore its not meaningful and we will be removing it from the dataset
+
+```{r}
+bike_df = subset(bike_df, weather != 'Heavy_rain_or_snow')
+```
+
+```{r}
+sum_bike_count_season <- aggregate(bike_count ~ season, data = bike_df, FUN = sum)
+
+sum_bike_count_season
+
+season_count_plot = ggplot(sum_bike_count_season, aes(x = season, y = bike_count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(x = "Season", y = "Bike_count (Total bikes rented)", title = "Bikes rented vs Season")
+
+season_count_plot
+```
+
+-   Maximum number of bikes have been rented during the fall followed by summer season.
+
+-   Lowest bikes have been rented during spring
+
+```{r}
+
+sum_bike_count_month <- aggregate(bike_count ~ month, data = bike_df, FUN = sum)
+
+sum_bike_count_month
+
+season_count_plot = ggplot(sum_bike_count_month, aes(x = month, y = bike_count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(x = "Month", y = "Bike_count (Total bikes rented)", title = "Bikes rented vs month")
+
+season_count_plot
+
+
+
+```
+
+```{r}
+sum_bike_count_hour <- aggregate(bike_count ~ hour, data = bike_df, FUN = sum)
+
+sum_bike_count_hour
+
+hour_count_plot = ggplot(sum_bike_count_hour, aes(x = hour, y = bike_count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(x = "Hour of the day", y = "Bike_count (Total bikes rented)", title = "Bikes rented vs Hour")
+
+hour_count_plot
+```
+
+-   More bikes are rented between 7-9 am and 5-7 pm --\> This might due to usual school and office hours of 9-5
+
+```{r}
+
+
+sum_bike_count_wday <- aggregate(bike_count ~ workingday, data = bike_df, FUN = sum)
+
+sum_bike_count_wday
+
+wday_count_plot = ggplot(sum_bike_count_wday, aes(x = workingday, y = bike_count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(x = "Working day", y = "Bike_count (Total bikes rented)", title = "Bikes rented vs Working day")
+
+wday_count_plot
+```
+
+-   As expected, working days have more bookings that non-working days in total. Will have to study the bookings per hour to see if the working days are preferred.
+
+```{r}
+
+sum_bike_count_holiday <- aggregate(bike_count ~ holiday, data = bike_df, FUN = sum)
+
+sum_bike_count_holiday
+
+holiday_count_plot = ggplot(sum_bike_count_holiday, aes(x = holiday, y = bike_count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(x = "holiday", y = "Bike_count (Total bikes rented)", title = "Bikes rented vs holiday")
+
+holiday_count_plot
+```
+
+```{r}
+
+sum_bike_count_weather <- aggregate(bike_count ~ weather, data = bike_df, FUN = mean)
+
+sum_bike_count_weather <- sum_bike_count_weather[-4,]
+
+weather_count_plot = ggplot(sum_bike_count_weather, aes(x = weather, y = bike_count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(x = "Weather", y = "Bikes per hour", title = "Bikes per hour vs Weather")
+
+weather_count_plot
+```
+
+-   As expected, more bikes are rented when the weather is clear or partly cloudy (1st bucket).
+
+```{r}
+sum_bike_count_season <- aggregate(bike_count ~ season, data = bike_df, FUN = mean)
+
+sum_bike_count_season
+
+season_count_plot = ggplot(sum_bike_count_season, aes(x = season, y = bike_count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(x = "Season", y = "Bikes per hour", title = "Bikes per hour vs Season")
+
+season_count_plot
+```
+
+-   Maximum number of bikes have been rented during the fall followed by summer season.
+
+-   Lowest bikes have been rented during spring
+
+```{r}
+
+sum_bike_count_month <- aggregate(bike_count ~ month, data = bike_df, FUN = mean)
+
+sum_bike_count_month
+
+season_count_plot = ggplot(sum_bike_count_month, aes(x = month, y = bike_count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(x = "Month", y = "Bikes per hour", title = "Bikes per hour vs Month")
+
+season_count_plot
+
+
+
+```
+
+```{r}
+sum_bike_count_hour <- aggregate(bike_count ~ hour, data = bike_df, FUN = mean)
+
+sum_bike_count_hour
+
+hour_count_plot = ggplot(sum_bike_count_hour, aes(x = hour, y = bike_count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(x = "Hour of the day", y = "Bikes per hour", title = "Bikes per hour vs Hour")
+
+hour_count_plot
+```
+
+-   More bikes are rented between 7-9 am and 5-7 pm --\> This might due to usual school and office hours of 9-5
+
+```{r}
+
+
+sum_bike_count_wday <- aggregate(bike_count ~ workingday, data = bike_df, FUN = mean)
+
+sum_bike_count_wday
+
+wday_count_plot = ggplot(sum_bike_count_wday, aes(x = workingday, y = bike_count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(x = "Working day", y = "Bikes per hour", title = "Bikes per hour vs Working day")
+
+wday_count_plot
+```
+
+-   Not a lot difference in bikes rented per hour between working day and non working day
+
+```{r}
+
+sum_bike_count_holiday <- aggregate(bike_count ~ holiday, data = bike_df, FUN = mean)
+
+sum_bike_count_holiday
+
+holiday_count_plot = ggplot(sum_bike_count_holiday, aes(x = holiday, y = bike_count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(x = "holiday", y = "Bikes per hour", title = "Bikes per hour vs holiday")
+
+holiday_count_plot
+```
+
+-   No significant difference in bikes rented per hour between Holiday and Non-Holiday
+-   On the whole, all the categorical variables have influence on the bike_count as per the EDA   results. 
+-   To understand the extent of infleunce i.e. significance of their impact on response, we will be doing ANOVA test post 1 hot encoding.
+
+Let us have a close look at the response i.e. bike_count before proceeding with the ANOVA
+
+### [Modeling considerations]{.underline}
+
+1.  checking if there are any significant outliers in the target variable - bike count
+
+```{r}
+
+library(ggplot2)
+library(plotly)
+
+# Boxplot
+boxplot(bike_df_num$bike_count, main = "Boxplot for Target variable (Bike count)",
+        xlab = "# Bikes per hour", col = 'brown', notch = TRUE, horizontal = TRUE)
+
+# Histogram and Density plot
+set.seed(1)
+gg <- ggplot(bike_df, aes(x = bike_count)) +
+  geom_histogram(aes(y = ..density..), bins = 7, fill = 'brown', alpha = 0.5) +
+  geom_density(color = 'red') +
+  geom_rug(color = 'red') +
+  ylab("") +
+  xlab("") +
+  theme(legend.title = element_blank()) +
+  scale_color_manual(values = c('density' = 'brown'))
+
+# Convert ggplot to plotly object
+ggp <- ggplotly(gg)
+
+# Update the layout
+ggp <- ggp %>%
+  layout(
+    title = "Target variable ( Bike count) ",
+    xaxis = list(title = '# Bikes', zeroline = FALSE, gridcolor = 'black'),
+    yaxis = list(title = 'Value A', zeroline = FALSE, gridcolor = 'black'),
+    plot_bgcolor = 'lightblue'
+  )
+
+# Show the plot
+print(ggp)
+
+# Histogram and Density plot (Log Transformation)
+gg_log <- ggplot(bike_df, aes(x = log(bike_count))) +
+  geom_histogram(aes(y = ..density..), bins = 7, fill = 'brown', alpha = 0.5) +
+  geom_density(color = 'red') +
+  geom_rug(color = 'red') +
+  ylab("") +
+  xlab("") +
+  theme(legend.title = element_blank()) +
+  scale_color_manual(values = c('density' = 'brown'))
+
+# Convert ggplot to plotly object
+ggp_log <- ggplotly(gg_log)
+
+# Update the layout
+ggp_log <- ggp_log %>%
+  layout(
+    title = "Target variable (Log Transformation)",
+    xaxis = list(title = '# Bikes', zeroline = FALSE, gridcolor = '#ffff'),
+    yaxis = list(title = 'Value A', zeroline = FALSE, gridcolor = '#ffff'),
+    plot_bgcolor = 'lightblue'
+  )
+
+# Show the plot
+print(ggp_log)
+
+```
+
+-   Its clear that there are many outliers in the bike count variable. We can remove records that fall outside of the 95% confidence interval (\~mean +/- 2 sd or \~mean+/- 3 sd)
+
+-   The bike count variable is right-skewed as well. To treat right-skew we can use logarithmic transformation --\> the distribution looks better after the tranformation.
+
+#### Log tranformation on Bike Count
+
+```{r}
+
+bike_df$log_bike_count = log(bike_df$bike_count)
+```
+
+#### Removing outliers on the target variable
+
+```{r}
+library(psych)
+mean_bike_count = mean(bike_df$bike_count, na.rm = TRUE)
+sd_bike_count = sd(bike_df$bike_count, na.rm = TRUE)
+print(mean_bike_count)
+print(sd_bike_count)
+describe(bike_df$bike_count)
+```
+
+```{r}
+
+bike_df_cln <- bike_df[abs(bike_df$bike_count - mean(bike_df$bike_count)) <= 3*sd(bike_df$bike_count),]   
+print(dim(bike_df)) 
+print(dim(bike_df_cln))  
+print(dim(bike_df)[1] - dim(bike_df_cln)[1] )
+```
+
+We are removing 147 record as they fall out of 3 standard deviations from the mean
+
+#### Encoding categorical variables
+
+```{r}
+
+
+one_hot_encoded_season <- model.matrix(~ season - 1 , data = bike_df_cln)
+one_hot_encoded_weather <- model.matrix(~ weather - 1 , data = bike_df_cln)
+one_hot_encoded_workingday <- model.matrix(~ workingday - 1 , data = bike_df_cln)
+one_hot_encoded_holiday <- model.matrix(~ holiday - 1 , data = bike_df_cln)
+
+
+
+bike_df_enc = cbind(bike_df_cln, one_hot_encoded_season, one_hot_encoded_weather, one_hot_encoded_workingday, one_hot_encoded_holiday)
+
+
+bike_df_enc$hour <- as.factor(bike_df_enc$hour)
+bike_df_enc$day <- as.factor(bike_df_enc$day)
+bike_df_enc$month <- as.factor(bike_df_enc$month)
+bike_df_enc$year <- as.factor(bike_df_enc$year)
+
+head(bike_df_enc)
+describe(bike_df_enc)
+```
+
+#### ANOVA for categorical variable selection
+
+- Now we have the response which is log transformed and cleaned. Our categorical predictors have also been converted to binary using 1 hot encoding
+
+```{r}
+
+# Linear Model to check for ANOVA
+lm_model_for_anova <- lm(log_bike_count ~ seasonSpring + seasonSummer + seasonFall + weatherClear + weatherCloud_Mist + holidayHoliday + workingdayWorking_day + hour + day + month + year, data = bike_df_enc)
+
+#ANOVA
+anova_result <- anova(lm_model_for_anova)
+
+# Print the ANOVA table
+print(anova_result)
+
+```
+
+-   From the table, we can see that the "season," "weather," "hour," "day," "month," and "year" variables all have very low p-values. It means that they are all significantly associated with the log_bike_count.
+-   On the other hand, the "holiday" variable has slightly higher p-values (0.769503), suggesting that they may not be statistically significant in explaining the variance in the log_bike_count. -
+-   Month factor looks off as instead of showing 11 different levels it is displaying only 8 (due to singuarities) and hence to avoid the confusion, we have decided to drop it from future models
+
+#### Standardization - Scaling the numeric variables - Min-Max Scaling
+
+( x - min(x) ) / Range (x)
+
+```{r}
+bike_df_enc$norm_temp = (bike_df_enc$temp - min(bike_df_enc$temp))/( max(bike_df_enc$temp) - min(bike_df_enc$temp))
+bike_df_enc$norm_atemp = (bike_df_enc$atemp - min(bike_df_enc$atemp))/( max(bike_df_enc$atemp) - min(bike_df_enc$atemp))
+bike_df_enc$norm_humidity = (bike_df_enc$humidity - min(bike_df_enc$humidity))/( max(bike_df_enc$humidity) - min(bike_df_enc$humidity))
+bike_df_enc$norm_windspeed = (bike_df_enc$windspeed - min(bike_df_enc$windspeed))/( max(bike_df_enc$windspeed) - min(bike_df_enc$windspeed))
+
+
+head(bike_df_enc)
+```
+
+Next steps - Running a simple linear regression model to check the extent of multicolinearity in the model
+
+#### Linear Regression
+
+```{r}
+
+bike_df_enc_reg <- select(bike_df_enc,-casual, -registered)
+
+
+lm_model_base = lm(log_bike_count ~  norm_temp + norm_atemp + norm_humidity + norm_windspeed + seasonSpring + seasonSummer + seasonFall + weatherClear + weatherCloud_Mist + holidayHoliday + workingdayWorking_day + hour + day + year, data = bike_df_enc_reg)
+
+print(summary(lm_model_base))
+print(summary(lm_model_base)$r.squared)
+print(summary(lm_model_base)$adj.r.squared)
+
+
+```
+
+-   The base model has R\^2 value of 0.8239 and Adj R\^2 value of 0.8229 which is considered good enough by standard
+-   In this model, holiday variable is coming out to be significant and may have influence on the response and hence, we are keeping them for further processing
+-   We will also check for multicolinearity in the model
+
+### Multicolinearity- Check
+
+#### VIF Check
+
+```{r}
+#Masking it here as it is not allowing to render the file
+library(car)
+
+vif_numbers <- vif(lm_model_base)
+print(vif_numbers)
+```
+
+-   This suggests high multicolinearity among temp and atemp predictors
+-   We are now going to remove the predictor atemp
+
+```{r}
+
+lm_model_1 = lm(log_bike_count ~  norm_temp + norm_humidity + norm_windspeed + seasonSpring + seasonSummer + seasonFall + weatherClear + weatherCloud_Mist + workingdayWorking_day + holidayHoliday + hour + day + year, data = bike_df_enc_reg)
+
+print(summary(lm_model_1))
+print(summary(lm_model_1)$r.squared)
+print(summary(lm_model_1)$adj.r.squared)
+
+```
+
+-   We observe that there is hardly any change in R\^2 and Adj R\^2 values after removal of the "Atemp" predictors
+
+-   Let us check for the multicolinearity in this model
+
+```{r}
+vif_numbers <- vif(lm_model_1)
+print(vif_numbers)
+```
+
+-   The low VIF number indicates that now relatively no multicolinearity is present in the model
+-   In the next steps, we can leverage variable regularization techniques
+-   For now, we will be checking LASSO and RIDGE and Elastic Net Regression
+
+### LASSO, RIDGE and Elastic Net Regression
+
+#### LASSO
+
+```{r}
+
+#install.packages("glmnet")
+library(glmnet)
+
+predictors <-  bike_df_enc[,c("norm_temp","norm_humidity", "norm_windspeed","seasonSpring","seasonSummer","seasonFall","weatherCloud_Mist","weatherClear","holidayHoliday","workingdayWorking_day")]
+
+#Removing factors as lasso does not accept character variables
+lasso_model <- cv.glmnet(as.matrix(predictors), bike_df_enc$log_bike_count, alpha = 1)
+selected_coef <- coef(lasso_model, s = lasso_model$lambda.min)
+print(selected_coef)
+```
+
+-   As per LASSO coefficients, no predictor has the coefficent which is exactly 0
+-   We can also check with RIDGE as well for regularization
+
+#### RIDGE
+
+```{r}
+#Ridge variable selection
+
+Ridge_model <- cv.glmnet(as.matrix(predictors), bike_df_enc$log_bike_count, alpha = 0)
+selected_coef_ridge <- coef(Ridge_model, s = Ridge_model$lambda.min)
+print(selected_coef_ridge)
+
+print(Ridge_model$lambda.min)
+```
+
+-   Ridge has also provided similar results as that of LASSO without severe punishment for any predictor
+
+#### Elastic Net Regression
+
+```{r}
+elastic_net_model <- cv.glmnet(as.matrix(predictors), bike_df_enc$log_bike_count, alpha = 0.5, nfolds = 5)
+optimal_lambda <- elastic_net_model$lambda.min
+optimal_lambda
+optimal_coef <- coef(elastic_net_model, s = "lambda.min")
+print(optimal_coef)
+
+```
+
+-   All the regularization techniques indiacte that there is no need for severe punishment for any of the coefficient from the set of predictors
+
+```{r}
+
+lm_model_2 = lm(log_bike_count ~  norm_temp + norm_humidity + norm_windspeed + seasonSpring + seasonSummer + seasonFall + weatherClear + weatherCloud_Mist + workingdayWorking_day + holidayHoliday + hour + day + year, data = bike_df_enc_reg)
+
+print(summary(lm_model_2))
+print(summary(lm_model_2)$r.squared)
+print(summary(lm_model_2)$adj.r.squared)
+# 
+vif_numbers <- vif(lm_model_2)
+print(vif_numbers)
+
+```
+
+-   As evident from the results, almost all of the day variables seem to be insignificant and hence possibly can be removed from the model
+
+```{r}
+lm_model_3 = lm(log_bike_count ~  norm_temp + norm_humidity + norm_windspeed + seasonSpring + seasonSummer + seasonFall + weatherClear + weatherCloud_Mist + workingdayWorking_day + holidayHoliday + hour + year, data = bike_df_enc_reg)
+
+print(summary(lm_model_3))
+print(summary(lm_model_3)$r.squared)
+print(summary(lm_model_3)$adj.r.squared)
+# 
+vif_numbers <- vif(lm_model_3)
+print(vif_numbers)
+```
+
+-   As per VIF results, we do see that most of the predictors are now having VIF values \< 5 which indicates lower multicolinearity than what we had started with
+-   We can now move on to other regression techniques and then we can make a decision on which one is the best suited for the problem in hand
+
+#### Forward and Backward Regression
+
+Forward Regression
+
+```{r}
+
+null = lm(log_bike_count~1, data = bike_df_enc_reg)
+full = lm(log_bike_count~norm_temp + norm_humidity + norm_windspeed + seasonSpring + seasonSummer + seasonFall + weatherClear + weatherCloud_Mist + workingdayWorking_day + holidayHoliday + hour + year, data = bike_df_enc_reg)
+
+regForward = step(null, scope=formula(full), direction="forward", k=log(length(bike_df_enc)))
+summary(regForward)$r.squared
+summary(regForward)$adj.r.squared
+
+```
+
+Backward Regression
+
+```{r}
+regBack = step(full, direction="backward", k=log(length(bike_df_enc)))
+summary(regBack)$r.squared
+summary(regBack)$adj.r.squared
+
+```
+
+-   This forward and backward rergression further proves that the variables at hand are all important for better model fit
+-   For the next steps where we will be trying out boosting. regression trees, random forest
+-   We will have to split the dataset into three fragments which will be used for the above techniques
+
+```{r}
+head(bike_df_enc)
+```
+
+**Splitting the data set into Train, Validation and Test**
+
+```{r}
+
+#--------------------------------------------------
+#train, val, test
+set.seed(99)
+n=nrow(bike_df_enc)
+n1=floor(n/2)
+n2=floor(n/4)
+n3=n-n1-n2
+ii = sample(1:n,n)
+bike_train=bike_df_enc[ii[1:n1],]
+bike_val = bike_df_enc[ii[n1+1:n2],]
+bike_test = bike_df_enc[ii[n1+n2+1:n3],]
+
+```
+
+**Regression Trees**
+
+```{r}
+
+library(rpart)
+#--------------------------------------------------
+#get big tree
+big.tree = rpart(log_bike_count~ norm_temp + norm_humidity + norm_windspeed + seasonSpring + seasonSummer + seasonFall + weatherClear + weatherCloud_Mist + workingdayWorking_day + holidayHoliday + hour + year,method="anova",data=bike_train,
+               control=rpart.control(minsplit=5,cp=.0001)) 
+nbig = length(unique(big.tree$where))
+cat('size of big tree: ',nbig,'\n')
+
+#--------------------------------------------------
+#fit on train, predict on val for vector of cp.
+cpvec = big.tree$cptable[,"CP"] #cp values to try
+ntree = length(cpvec) #number of cv values = number of trees fit.
+iltree = rep(0,ntree) #in-sample loss
+oltree = rep(0,ntree) #out-of-sample loss
+sztree = rep(0,ntree) #size of each tree
+for(i in 1:ntree) {
+   if((i %% 10)==0) cat('tree i: ',i,'\n')
+   temptree = prune(big.tree,cp=cpvec[i])
+   sztree[i] = length(unique(temptree$where))
+   iltree[i] = sum((bike_train$log_bike_count-predict(temptree))^2)
+   ofit = predict(temptree,bike_val)
+   oltree[i] = sum((bike_val$log_bike_count-ofit)^2)
+ 
+}
+oltree=sqrt(oltree/nrow(bike_val)); iltree = sqrt(iltree/nrow(bike_train))
+#--------------------------------------------------
+#plot losses
+
+rgl = range(c(iltree,oltree))
+plot(range(sztree),rgl,type='n',xlab='tree size',ylab='loss')
+points(sztree,iltree,pch=15,col='red')
+points(sztree,oltree,pch=16,col='blue')
+legend("topright",legend=c('in-sample','out-of-sample'),lwd=3,col=c('red','blue'))
+
+#--------------------------------------------------
+#write val preds
+iitree = which.min(oltree)
+thetree = prune(big.tree,cp=cpvec[iitree])
+thetreepred = predict(thetree,bike_val)
+cat("The optimal tree size = ", iitree, "\n")
+cat("The cp value that gives the optimal trees = ", cpvec[iitree] , "\n")
+cat("Out of sample Loss value = ", oltree[iitree] , "\n")
+
+```
+
+**Random forest**
+
+```{r}
+library(randomForest)
+#--------------------------------------------------
+set.seed(1)
+p=ncol(bike_train)-1
+mtryv = c(5,10)
+ntreev = c(500,1000)
+parmrf = expand.grid(mtryv,ntreev)
+colnames(parmrf)=c('mtry','ntree')
+nset = nrow(parmrf)
+olrf = rep(0,nset)
+ilrf = rep(0,nset)
+rffitv = vector('list',nset)
+for(i in 1:nset) {
+    cat('doing rf ',i,' out of ',nset,'\n')
+   temprf = randomForest(log_bike_count~ norm_temp + norm_humidity + norm_windspeed + seasonSpring + seasonSummer + seasonFall + weatherClear + weatherCloud_Mist + workingdayWorking_day + holidayHoliday + hour + year,data=bike_train,mtry=parmrf[i,1],ntree=parmrf[i,2])
+   ifit = predict(temprf)
+   ofit=predict(temprf,newdata=bike_val)
+   olrf[i] = sum((bike_val$log_bike_count-ofit)^2)
+   ilrf[i] = sum((bike_train$log_bike_count-ifit)^2)
+   rffitv[[i]]=temprf
+}
+ilrf = round(sqrt(ilrf/nrow(bike_train)),3); olrf = round(sqrt(olrf/nrow(bike_val)),3)
+#----------------------------------------
+#print losses
+
+print(cbind(parmrf,olrf,ilrf))
+
+#----------------------------------------
+#write val preds
+iirf=which.min(olrf)
+therf = rffitv[[iirf]]
+therfpred=predict(therf,newdata=bike_val)
+write(therfpred,file='therfpred.txt',ncol=1)
+
+varImpPlot(rffitv[[iirf]])
+
+```
+
+**Boosting**
+
+```{r}
+
+library(gbm)
+
+#--------------------------------------------------
+set.seed(1)
+idv = c(8,10) # Depth of the tree
+ntv = c(1000,5000) #Nuber of trees
+lamv=c( 0.01, 0.02) #Crushing fator
+parmb = expand.grid(idv,ntv,lamv)
+colnames(parmb) = c('tdepth','ntree','lam')
+print(parmb)
+nset = nrow(parmb)
+olb = rep(0,nset)
+ilb = rep(0,nset)
+bfitv = vector('list',nset)
+for(i in 1:nset) {
+  cat('doing boost ',i,' out of ',nset,'\n')
+  tempboost = gbm(log_bike_count ~  norm_temp + norm_humidity + norm_windspeed + seasonSpring + seasonSummer + seasonFall + weatherClear + workingdayWorking_day + weatherLittle_rain_or_snow + holidayHoliday+hour + year,data=bike_train,distribution='gaussian',
+                  interaction.depth=parmb[i,1],n.trees=parmb[i,2],shrinkage=parmb[i,3])
+  ifit = predict(tempboost,n.trees=parmb[i,2])
+  ofit=predict(tempboost,newdata=bike_val,n.trees=parmb[i,2])
+  olb[i] = sum((bike_val$log_bike_count-ofit)^2)
+  ilb[i] = sum((bike_train$log_bike_count-ifit)^2)
+  bfitv[[i]]=tempboost
+}
+ilb = round(sqrt(ilb/nrow(bike_train)),3); olb = round(sqrt(olb/nrow(bike_val)),3)
+#--------------------------------------------------
+#print losses
+
+print(cbind(parmb,olb,ilb))
+
+#--------------------------------------------------
+#write val preds
+iib=which.min(olb)
+theb = bfitv[[iib]] 
+thebpred = predict(theb,newdata=bike_val,n.trees=parmb[iib,2])
+
+#----------------------------------------------------------------
+#fit on train+val
+
+set.seed(5)
+bike_trainval = rbind(bike_train,bike_val)
+ntrees=5000
+finb = gbm(log_bike_count ~  norm_temp + norm_humidity + norm_windspeed + seasonSpring + seasonSummer + seasonFall + seasonWinter + weatherClear + workingdayWorking_day + weatherLittle_rain_or_snow + weatherCloud_Mist  + holidayHoliday + hour + year,data=bike_trainval,distribution='gaussian',
+           interaction.depth=8,n.trees=ntrees,shrinkage=.02)
+finbpred=predict(finb,newdata=bike_test,n.trees=ntrees)
+#--------------------------------------------------
+#plot y vs yhat for test data and compute rmse on test.
+
+
+finbrmse = sqrt(sum((bike_test$log_bike_count-finbpred)^2)/nrow(bike_test))
+cat('finbrmse: ',finbrmse,'\n')
+plot(bike_test$log_bike_count,finbpred,xlab='test log_bike_count',ylab='boost pred')
+abline(0,1,col='red',lwd=2)
+
+
+
+```
+
+```{r}
+library(caret)
+var_imp_finb <- summary(finb)
+
+# Print the variable importance
+print(var_imp_finb)
+```
+
+```{r}
+# Load required libraries
+library(ggplot2)
+
+var_imp_finb$var <- factor(var_imp_finb$var, levels = var_imp_finb$var)
+print(var_imp_finb)
+
+# Create the bar chart
+ggplot(var_imp_finb, aes(x = var, y = rel.inf)) +
+  geom_bar(stat = "identity", fill = "blue") +
+  labs(title = "Bar Chart with Relative Values", x = "Variable", y = "Relative Value") +
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
